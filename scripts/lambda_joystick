@@ -1,0 +1,116 @@
+#!/usr/bin/python3
+
+""" A simple example that illustrates use of the Force Dimension ROS2 package.
+"""
+
+# ROS imports.
+import math
+import rclpy
+import rclpy.node
+from example_interfaces.msg import Float64
+from geometry_msgs.msg import Point, Quaternion, Vector3
+from sensor_msgs.msg import JointState
+import numpy as np
+import scipy.spatial.transform as tf
+
+def quat2rot(q):
+    """ Convert quaternion to axis-angle representation. """
+    quat = tf.Rotation.from_quat([q[1], q[2], q[3], q[0]])  # Convert [w, x, y, z] to [x, y, z, w]
+    angle = 2 * np.arccos(q[0])  # Extract angle
+    if angle > 1e-6:
+        axis = quat.as_rotvec() / angle  # Normalize axis
+    else:
+        axis = np.zeros(3)
+    return angle * axis
+
+
+# Entry point for ROS2.
+def main():
+    """ A simple function for creating a ROS2 node that subscribes to Force 
+        Dimension position and orientation messages and applies spring-damper forces.
+    """
+    
+    # Initialize ROS.
+    rclpy.init()
+    
+    # Create a new ROS2 node.
+    node = rclpy.node.Node('optimo_node')
+    
+    # Initialize variables to hold position and orientation.
+    position = np.zeros(3)
+    velocity = np.zeros(3)
+    orientation = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion
+    angular_velocity = np.zeros(3)
+    
+    # Control gains
+    k_p = 100.0  # Translational stiffness
+    k_d = 5.0   # Translational damping
+    k_r = 1.0   # Rotational stiffness
+    k_w = 0.01    # Rotational damping
+
+    def position_callback(msg):
+        nonlocal position
+        position = np.array([msg.x, msg.y, msg.z])
+
+    def velocity_callback(msg):
+        nonlocal velocity
+        velocity = np.array([msg.x, msg.y, msg.z])
+
+    def orientation_callback(msg):
+        nonlocal orientation
+        orientation = np.array([msg.w, msg.x, msg.y, msg.z])
+
+    def angular_velocity_callback(msg):
+        nonlocal angular_velocity
+        angular_velocity = np.array([msg.x, msg.y, msg.z])
+
+    # Subscribe to position and orientation topics.
+    node.create_subscription(Point, '/robot/feedback/position', position_callback, 10)
+    node.create_subscription(Vector3, '/robot/feedback/velocity', velocity_callback, 10)
+    node.create_subscription(Quaternion, '/robot/feedback/orientation', orientation_callback, 10)
+    node.create_subscription(Vector3, '/robot/feedback/angular_velocity', angular_velocity_callback, 10)
+
+    # Create publishers
+    force_publisher = node.create_publisher(Vector3, '/robot/command/force', 10)
+    torque_publisher = node.create_publisher(Vector3, '/robot/command/torque', 10)
+    gripper_force_publisher = node.create_publisher(Float64, '/robot/command/gripper_force', 10)
+
+    # joystick function to regulate to zero position and orientation
+    def joystick_controller():
+        nonlocal position, velocity, orientation, angular_velocity
+        
+        # Compute restoring force (spring-damper for translation)
+        force = -k_p * position - k_d * velocity
+
+        # Compute restoring torque (spring-damper for rotation)
+        identity_quaternion = np.array([1.0, 0.0, 0.0, 0.0])  # Target orientation
+        rotation_vector = quat2rot(orientation)  # Compute rotation error using quat2rot
+        torque = -k_r * rotation_vector - k_w * angular_velocity
+
+        # Publish force
+        force_msg = Vector3()
+        force_msg.x, force_msg.y, force_msg.z = force
+        force_publisher.publish(force_msg)
+
+        # Publish torque
+        torque_msg = Vector3()
+        torque_msg.x, torque_msg.y, torque_msg.z = torque
+        torque_publisher.publish(torque_msg)
+
+        # Publish gripper force (set to zero)
+        gripper_force_msg = Float64()
+        gripper_force_msg.data = 0.0
+        gripper_force_publisher.publish(gripper_force_msg)
+
+    # Create a timer to update forces
+    timer = node.create_timer(0.001, joystick_controller)
+    
+    # Spin the node.
+    rclpy.spin(node)
+    
+    # Shutdown ROS.
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+

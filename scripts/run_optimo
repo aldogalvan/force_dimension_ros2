@@ -1,0 +1,151 @@
+#!/usr/bin/python3
+
+""" A simple example that illustrates use of the Force Dimension ROS2 package.
+"""
+
+# ROS imports.
+import math
+import rclpy
+import rclpy.node
+from example_interfaces.msg import Float64
+from geometry_msgs.msg import Point, Quaternion, TwistStamped, Vector3
+from sensor_msgs.msg import JointState
+
+import numpy as np
+
+# Define a function to create a transformation matrix from DH parameters
+def dh_matrix(a, alpha, d, theta):
+    return np.array([
+        [np.cos(theta), -np.sin(theta), 0, a],
+        [np.sin(theta) * np.cos(alpha), np.cos(theta) * np.cos(alpha), -np.sin(alpha), -d * np.sin(alpha)],
+        [np.sin(theta) * np.sin(alpha), np.cos(theta) * np.sin(alpha), np.cos(alpha), d * np.cos(alpha)],
+        [0, 0, 0, 1]
+    ])
+
+# Define the DH parameters for each joint (a, alpha, d, theta)
+dh_params = [
+    (0, 0, 0, 'theta1'),
+    (0, -np.pi/2, 0, 'theta2'),
+    (0, 0, 0.4, 'theta3'),
+    (0, -np.pi/2, 0, 'theta4'),
+    (0, np.pi/2, 0.4, 'theta5'),
+    (0, -np.pi/2, 0, 'theta6'),
+    (0, 0, 0, 'theta7')
+]
+
+# Define the forward kinematics function
+def forward_kinematics(thetas):
+    T = np.eye(4)  # Initialize transformation matrix as identity matrix
+    for i, (a, alpha, d, theta) in enumerate(dh_params):
+        T = np.dot(T, dh_matrix(a, alpha, d, eval(theta)))
+    return T
+
+# Test the function with a set of joint angles
+thetas = {
+    'theta1': 0,
+    'theta2': np.pi/4,
+    'theta3': np.pi/3,
+    'theta4': np.pi/6,
+    'theta5': np.pi/3,
+    'theta6': np.pi/4,
+    'theta7': np.pi/6
+}
+
+def norm(vec):
+    mag = math.sqrt(vec.x**2 + vec.y**2 + vec.z**2)
+    if mag < 1e-3:
+        vec.x = 0.0
+        vec.y = 0.0
+        vec.z = 0.0
+    else:
+        vec.x = vec.x/mag
+        vec.y = vec.y/mag
+        vec.z = vec.z/mag
+    return vec
+
+# Entry point for ROS2.
+def main():
+    """ A simple function for creating a ROS2 node that subscribes to Force 
+        Dimension position and orientation messages and publishes to /twist_cmds.
+    """
+    
+    # Initialize ROS.
+    rclpy.init()
+    
+    # Create a new ROS2 node.
+    node = rclpy.node.Node('optimo_node')
+    
+    # Initialize variables to hold position and orientation.
+    position = None
+    orientation = None
+    velocity = None
+    angular_velocity = None
+    gripper_angle = 0
+    joint_states = None
+
+    # Define callback functions for the subscribed topics.
+    def position_callback(msg):
+        nonlocal position
+        position = msg
+
+    def orientation_callback(msg):
+        nonlocal orientation
+        orientation = msg
+
+    def velocity_callback(msg):
+        nonlocal velocity
+        velocity = norm(msg)
+
+    def angular_velocity_callback(msg):
+        nonlocal angular_velocity
+        angular_velocity = norm(msg)
+
+    def gripper_angle_callback(msg):
+        nonlocal gripper_angle
+        gripper_angle = msg.data
+
+    def joint_states_callback(msg):
+        nonlocal joint_states
+        joint_states = msg
+        joint_positions = []
+        for position in msg.position:
+            joint_positions.append(position)
+        node.get_logger().info(f'All joint positions: {joint_positions}')
+
+    # Subscribe to position and orientation topics.
+    position_subscription = node.create_subscription(Point, '/robot/feedback/position', position_callback, 10)
+    orientation_subscription = node.create_subscription(Quaternion, '/robot/feedback/orientation', orientation_callback, 10)
+    velocity_subscription = node.create_subscription(Vector3, '/robot/feedback/velocity', velocity_callback, 10)
+    angular_velocity_subscription = node.create_subscription(Vector3, '/robot/feedback/angular_velocity', angular_velocity_callback, 10)
+    gripper_angle_subscription = node.create_subscription(Float64, '/robot/feedback/gripper_angle', gripper_angle_callback, 10)
+    joint_states_subscription = node.create_subscription(JointState, '/joint_states', joint_states_callback, 10)
+    
+    # Create a publisher for the force command and twist command
+    force_publisher = node.create_publisher(Vector3, '/robot/command/force', 10)
+    twist_publisher = node.create_publisher(TwistStamped, '/servo_node/delta_twist_cmds', 10)
+    
+    # Define a function to command a force.
+    def command_force():
+        force_msg = Vector3()
+        force_msg.x = 0.0
+        force_msg.y = 0.0
+        force_msg.z = 0.0
+        force_publisher.publish(force_msg)
+
+    # Function placeholder for publishing twist
+    def publish_twist():
+        pass  # Implement your twist publishing logic here
+
+    # Create a timer to publish TwistStamped messages and command a force.
+    timer = node.create_timer(0.01, lambda: (publish_twist(), command_force()))
+    
+    # Spin the node.
+    rclpy.spin(node)
+    
+    # Shutdown ROS.
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+

@@ -1,0 +1,160 @@
+#!/usr/bin/python3
+
+""" A simple example that illustrates use of the Force Dimension ROS2 package.
+"""
+
+# ROS imports.
+import math
+import rclpy
+import rclpy.node
+from example_interfaces.msg import Float64
+from geometry_msgs.msg import Point, Quaternion, TwistStamped, Vector3
+from sensor_msgs.msg import JointState
+
+import numpy as np
+
+
+# Entry point for ROS2.
+def main():
+    """ A simple function for creating a ROS2 node that subscribes to Force 
+        Dimension position and orientation messages and publishes to /twist_cmds.
+    """
+    
+    # Initialize ROS.
+    rclpy.init()
+    
+    # Create a new ROS2 node.
+    node = rclpy.node.Node('optimo_node')
+    
+    # Initialize variables to hold position and orientation.
+    position = None
+    orientation = None
+    velocity = None
+    angular_velocity = None
+    gripper_angle = 0
+    joint_states = None
+    deadzone = 0.05
+
+    # Define callback functions for the subscribed topics.
+    def position_callback(msg):
+        nonlocal position
+        position = msg
+        # Adjust x
+        if abs(position.x) < deadzone:
+            position.x = 0.0
+        elif position.x > 0:
+            position.x -= deadzone
+        else:
+            position.x += deadzone
+
+        # Adjust y
+        if abs(position.y) < deadzone:
+            position.y = 0.0
+        elif position.y > 0:
+            position.y -= deadzone
+        else:
+            position.y += deadzone
+
+        # Adjust z
+        if abs(position.z) < deadzone:
+            position.z = 0.0
+        elif position.z > 0:
+            position.z -= deadzone
+        else:
+            position.z += deadzone
+
+    def orientation_callback(msg):
+        nonlocal orientation
+        orientation = msg
+
+    def velocity_callback(msg):
+        nonlocal velocity
+        velocity = msg
+
+    def angular_velocity_callback(msg):
+        nonlocal angular_velocity
+        angular_velocity = msg
+
+    def gripper_angle_callback(msg):
+        nonlocal gripper_angle
+        gripper_angle = msg.data
+
+    def joint_states_callback(msg):
+        nonlocal joint_states
+        joint_states = msg
+        joint_positions = []
+        for position in msg.position:
+            joint_positions.append(position)
+
+    # Subscribe to position and orientation topics.
+    position_subscription = node.create_subscription(Point, '/robot/feedback/position', position_callback, 10)
+    orientation_subscription = node.create_subscription(Quaternion, '/robot/feedback/orientation', orientation_callback, 10)
+    velocity_subscription = node.create_subscription(Vector3, '/robot/feedback/velocity', velocity_callback, 10)
+    angular_velocity_subscription = node.create_subscription(Vector3, '/robot/feedback/angular_velocity', angular_velocity_callback, 10)
+    gripper_angle_subscription = node.create_subscription(Float64, '/robot/feedback/gripper_angle', gripper_angle_callback, 10)
+    joint_states_subscription = node.create_subscription(JointState, '/joint_states', joint_states_callback, 10)
+    
+    # Create a publisher for the force command and twist command
+    force_publisher = node.create_publisher(Vector3, '/robot/command/force', 10)
+    twist_publisher = node.create_publisher(TwistStamped, '/servo_node/delta_twist_cmds', 10)
+    
+    # Define a function to command a force.
+    def command_force():
+        force_msg = Vector3()
+        force_msg.x = 0.0
+        force_msg.y = 0.0
+        force_msg.z = 0.0
+        force_publisher.publish(force_msg)
+
+    def publish_twist():
+        if position is not None:
+            msg = TwistStamped()
+            msg.header.stamp = node.get_clock().now().to_msg()
+            msg.header.frame_id = 'link7_passive'
+            msg.twist.linear.x = -6*position.x if position.x is not None else 0.0
+            msg.twist.linear.y = 6*position.y if position.y is not None else 0.0
+            msg.twist.linear.z = -6*position.z if position.z is not None else 0.0
+            msg.twist.angular.x = 0.0
+            msg.twist.angular.y = 0.0
+            msg.twist.angular.z = 0.0
+            twist_publisher.publish(msg)
+
+
+        
+    # parameters
+    k = 1
+    b = 1
+    
+    # Calibration procedure with a two-second timer
+    node.get_logger().info('Starting calibration procedure')
+    start_time = node.get_clock().now()
+    # while (node.get_clock().now() - start_time).to_msg().sec < 2.0:
+
+    #     # Initialize the force as a Vector3 message
+    #     f = Vector3()
+
+    #     # Perform the calculation for each component
+    #     f.x = k * position.x - b * velocity.x
+    #     f.y = k * position.y - b * velocity.y
+    #     f.z = k * position.z - b * velocity.z
+
+    #     force_publisher.publish(f)
+    #     # For demonstration, we're logging a message. Replace or remove this with your actual calibration logic
+    #     node.get_logger().info('Calibration in progress...')
+    #     rclpy.spin_once(node, timeout_sec=0.1)  # This allows callbacks to be processed during the calibration
+
+    # node.get_logger().info('Calibration procedure completed')
+
+    # Create a timer to publish TwistStamped messages and command a force.
+    timer = node.create_timer(0.01, lambda: (publish_twist(), command_force()))
+    
+    # Spin the node.
+    rclpy.spin(node)
+    
+    # Shutdown ROS.
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+
