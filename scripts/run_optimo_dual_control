@@ -1,0 +1,392 @@
+#!/usr/bin/python3
+
+""" 
+A simple example that illustrates use of the Force Dimension ROS2 package with two teleoperation modes.
+Joystick controller is the default, and transparency_controller is enabled while key 'b' is pressed.
+A delay is implemented during switching where a zero twist is published.
+"""
+
+# ROS imports.
+import math
+import rclpy
+import rclpy.node
+from example_interfaces.msg import Float64
+from geometry_msgs.msg import Point, Quaternion, Vector3, TwistStamped, Pose
+from optimo_msgs.msg import PoseElbow 
+from sensor_msgs.msg import JointState
+import numpy as np
+import scipy.spatial.transform as tf
+import atexit
+from pynput import keyboard
+
+
+# --- Workaround: Custom Listener subclass ---
+class MyKeyboardListener(keyboard.Listener):
+    # Provide a dummy _handle method if it doesn't exist.
+    def _handle(self, *args, **kwargs):
+        pass
+
+# Global flag for transparency mode.
+transparency_mode = False
+
+
+# --- PID Controller for 6D Twist ---
+class VectorPID:
+    def __init__(self, Kp, Ki, Kd, dt, tau=0.01):
+        # Gains are provided as arrays/lists of length 6.
+        self.Kp = np.array(Kp)
+        self.Ki = np.array(Ki)
+        self.Kd = np.array(Kd)
+        self.dt = dt
+        self.tau = tau  # time constant for the low-pass filter on the derivative term.
+        self.integral = np.zeros(6)
+        self.prev_error = np.zeros(6)
+        self.filtered_derivative = np.zeros(6)  # Initialize the filtered derivative.
+
+    def update(self, error):
+        # Update the integral term.
+        self.integral += error * self.dt
+        
+        # Compute the raw derivative.
+        derivative = (error - self.prev_error) / self.dt
+        
+        # Apply a first-order low-pass filter to the derivative.
+        # alpha = dt / (tau + dt) determines the filter cutoff.
+        alpha = self.dt / (self.tau + self.dt)
+        self.filtered_derivative = alpha * derivative + (1 - alpha) * self.filtered_derivative
+        
+        # Save current error for next derivative calculation.
+        self.prev_error = error
+        
+        # Return the PID output using the filtered derivative.
+        return self.Kp * error + self.Ki * self.integral + self.Kd * self.filtered_derivative
+
+
+def quat2rot(q):
+    """
+    Convert a quaternion (given as [x, y, z, w]) to an axis-angle representation.
+    
+    The function creates a rotation from the quaternion using SciPy’s Rotation,
+    then computes the rotation angle as 2 * arccos(w) and returns the rotation vector,
+    which is the rotation axis scaled by the rotation angle.
+    """
+    # Create a rotation object directly from q (which is [x, y, z, w]).
+    quat = tf.Rotation.from_quat(q)
+    # The scalar part is now q[3].
+    angle = 2 * np.arccos(q[3])
+    if angle > 1e-6:
+        # The rotation vector from as_rotvec() is axis*angle.
+        # To get the unit axis, we divide by the angle.
+        axis = quat.as_rotvec() / angle
+    else:
+        axis = np.zeros(3)
+    # Return the rotation vector (axis scaled by the angle).
+    return angle * axis
+
+
+def euler_from_quaternion(x, y, z, w):
+    """
+    Converts quaternion (w in last place) to euler roll, pitch, yaw.
+    quaternion = [x, y, z, w]
+    """
+    sinr_cosp = 2 * (w * x + y * z)
+    cosr_cosp = 1 - 2 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2 * (w * y - z * x)
+    pitch = np.arcsin(sinp)
+
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+    return roll, pitch, yaw
+    
+def apply_transformation(Tab, Ta):
+    """
+    Applies transformation Tab to transformation Ta to produce transformation Tb.
+
+    Each transformation is represented as a dictionary with:
+      'position': a 3-element NumPy array (translation vector).
+      'orientation': a 4-element NumPy array (quaternion in [x, y, z, w] format).
+
+    The composition is computed as:
+      Tb.position = Tab.position + R(Tab.orientation) applied to Ta.position
+      Tb.orientation = Tab.orientation ⊗ Ta.orientation (using quaternion multiplication)
+    
+    Returns:
+      Tb: a dictionary with keys 'position' and 'orientation'
+    """
+    # Extract positions and orientations.
+    p_ab = Tab['position']
+    q_ab = Tab['orientation']
+    p_a = Ta['position']
+    q_a = Ta['orientation']
+    
+    # Create rotation objects from the quaternions.
+    r_ab = tf.Rotation.from_quat(q_ab)  # expects [x, y, z, w]
+    r_a = tf.Rotation.from_quat(q_a)
+    
+    # Compute the composed rotation.
+    # The operator * for Rotation objects corresponds to applying r_a first, then r_ab.
+    r_b = r_ab * r_a
+    
+    # Compute the composed translation.
+    # We first rotate p_a by r_ab and then add the translation p_ab.
+    p_b = p_ab + r_ab.apply(p_a)
+    
+    # Convert the composed rotation back to a quaternion.
+    q_b = r_b.as_quat()  # returns in [x, y, z, w] order
+    
+    return {'position': p_b, 'orientation': q_b}
+    
+def invert_transform(T):
+    p = T['position']
+    q = T['orientation']
+    
+    # Create a rotation object from the quaternion.
+    r = tf.Rotation.from_quat(q)  # expects [x, y, z, w]
+    
+    # Invert the rotation.
+    r_inv = r.inv()
+    
+    # The inverse translation is the negative of the original translation
+    # rotated by the inverse rotation.
+    p_inv = - r_inv.apply(p)
+    
+    # Get the quaternion for the inverse rotation.
+    q_inv = r_inv.as_quat()  # returns in [x, y, z, w] format.
+    
+    return {'position': p_inv, 'orientation': q_inv}
+    
+def compute_twist(Ta, Tb):
+    # Compute the inverse of Ta.
+    T_inv_a = invert_transform(Ta)
+    # Compute the relative transformation: T_err = Ta^{-1} * Tb.
+    T_err = apply_transformation(T_inv_a, Tb)
+    
+    # The linear error is simply the translation component.
+    linear_error = T_err['position']
+    # The angular error is extracted as a rotation vector from the quaternion.
+    angular_error = tf.Rotation.from_quat(T_err['orientation']).as_rotvec()
+    
+    return np.array([linear_error[0],linear_error[1],linear_error[2],angular_error[0],angular_error[1], angular_error[2]]) 
+
+
+# Key event callbacks.
+def on_press(key):
+    global transparency_mode
+    try:
+        if key.char == 'b':
+            transparency_mode = True
+    except AttributeError:
+        pass
+
+def on_release(key):
+    global transparency_mode
+    try:
+        if key.char == 'b':
+            transparency_mode = False
+    except AttributeError:
+        pass
+
+# Start the keyboard listener using the custom subclass.
+listener = MyKeyboardListener(on_press=on_press, on_release=on_release)
+listener.start()
+
+# Entry point for ROS2.
+def main():
+    """ 
+    Create a ROS2 node that subscribes to robot feedback and implements two teleoperation modes,
+    including a transition delay with zero twist commands.
+    """
+    rclpy.init()
+    node = rclpy.node.Node('optimo_node')
+    
+    # Initialize variables to hold position, velocity, orientation, etc.
+    position = np.zeros(3)
+    velocity = np.zeros(3)
+    orientation = np.array([ 0.0, 0.0, 0.0, 1.0])  # Identity quaternion.
+    angular_velocity = np.zeros(3)
+    T_lambda_optimo_base = {
+        'position': np.array([0.0, 0.0, 0.0]),
+        'orientation': np.array([ 0.0, 0.0, 1.0, 0.0]) # Not a bug! Actual transformation from lambda frame to optimo base
+    }
+    
+    T_optimo_base_hand = {
+        'position': np.array([0.44, 0.0, 0.5]),
+        'orientation': np.array([ 0.7071068, 0, 0.7071068, 0 ]) # Transformation from optimo base to hand in zero configuration
+    }
+    
+    ee_pose = {
+        'position': np.array([0.44, 0.0, 0.5]),
+        'orientation': np.array([ 0.825, 0, 0.565, 0 ])  # Identity quaternion
+    }
+    
+    # some constants
+    linear_threshold = 1e-2
+    angular_threshold = 0.2
+    linear_scale = 10.
+    angular_scale = 0.2
+    
+    # Joystick gains.
+    k_p = 200.0  # Translational stiffness.
+    k_d = 10.0    # Translational damping.
+    k_r = 2.0    # Rotational stiffness.
+    k_w = 0.015   # Rotational damping.If I have a transformation Tb defined
+    
+    # --- PID Gains for the error twist ---
+    # You may need to tune these gains.
+    pid_Kp = [2.0, 2.0, 2.0, 0.5, 0.5, 0.5]
+    pid_Ki = [0, 0, 0, 0, 0, 0]
+    pid_Kd = [0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
+    pid_dt = 0.001  # Use the same dt as the control loop timer.
+    pid = VectorPID(pid_Kp, pid_Ki, pid_Kd, pid_dt)
+    
+    # Variables for transition delay.
+    transition_delay = 0.3  # seconds
+    last_mode_switch_time = None
+    prev_mode = transparency_mode  # store previous mode state
+
+    def position_callback(msg):
+        nonlocal position
+        position = np.array([msg.x, msg.y, msg.z])
+
+    def velocity_callback(msg):
+        nonlocal velocity
+        velocity = np.array([msg.x, msg.y, msg.z])
+
+    def orientation_callback(msg):
+        nonlocal orientation
+        orientation = np.array([msg.x, msg.y, msg.z, msg.w])
+
+    def angular_velocity_callback(msg):
+        nonlocal angular_velocity
+        angular_velocity = np.array([msg.x, msg.y, msg.z])
+        
+    def ee_pose_callback(msg):
+        nonlocal ee_pose
+        ee_pose['position'] = np.array([msg.pose.position.x, msg.pose.position.y,msg.pose.position.z])
+        ee_pose['orientation'] = np.array([msg.pose.orientation.x, msg.pose.orientation.y,msg.pose.orientation.z,msg.pose.orientation.w])
+
+    # Subscribe to topics.
+    node.create_subscription(Point, '/robot/feedback/position', position_callback, 10)
+    node.create_subscription(Vector3, '/robot/feedback/velocity', velocity_callback, 10)
+    node.create_subscription(Quaternion, '/robot/feedback/orientation', orientation_callback, 10)
+    node.create_subscription(Vector3, '/robot/feedback/angular_velocity', angular_velocity_callback, 10)
+    node.create_subscription(PoseElbow,"/optimo/ee_pose_current", ee_pose_callback, 10)
+
+    # Create publishers.
+    force_publisher = node.create_publisher(Vector3, '/robot/command/force', 10)
+    torque_publisher = node.create_publisher(Vector3, '/robot/command/torque', 10)
+    gripper_force_publisher = node.create_publisher(Float64, '/robot/command/gripper_force', 10)
+    twist_publisher = node.create_publisher(TwistStamped, '/optimo/servo/twist_cmd', 10)
+    
+    # Joystick controller: computes spring-damper forces and publishes twist commands.
+    def joystick_controller():
+        nonlocal position, velocity, orientation, angular_velocity
+        # Command the force and torque
+        force = -k_p * position - k_d * velocity
+        rotation_vector = quat2rot(orientation)
+        torque = -k_r * rotation_vector - k_w * angular_velocity
+
+        force_msg = Vector3(x=force[0], y=force[1], z=force[2])
+        force_publisher.publish(force_msg)
+
+        torque_msg = Vector3(x=torque[0], y=torque[1], z=torque[2])
+        torque_publisher.publish(torque_msg)
+
+        gripper_force_msg = Float64(data=0.0)
+        gripper_force_publisher.publish(gripper_force_msg)
+        
+        # Publish output
+        T_lambda = {'position':position, 'orientation':orientation}
+        #T_optimo = apply_transformation(T_lambda_optimo_base, T_lambda)
+        T_optimo = apply_transformation(T_lambda_optimo_base, apply_transformation(T_lambda,invert_transform(T_lambda_optimo_base)))
+        twist_out = TwistStamped()
+        if np.linalg.norm(T_optimo['position']) > linear_threshold:
+            twist_out.twist.linear.x = linear_scale * T_optimo['position'][0]
+            twist_out.twist.linear.y = linear_scale * T_optimo['position'][1]
+            twist_out.twist.linear.z = linear_scale * T_optimo['position'][2]
+        roll, pitch, yaw = euler_from_quaternion(T_optimo['orientation'][0], T_optimo['orientation'][1], T_optimo['orientation'][2], T_optimo['orientation'][3])
+
+        if abs(roll) > angular_threshold:   twist_out.twist.angular.x = angular_scale * roll
+        if abs(pitch) > angular_threshold:  twist_out.twist.angular.y = angular_scale * pitch
+        if abs(yaw) > angular_threshold:    twist_out.twist.angular.z = angular_scale * yaw
+        twist_publisher.publish(twist_out)
+
+    # Transparency controller: active while key 'b' is pressed.
+    def transparency_controller():
+        T_lambda = {'position':position, 'orientation':orientation}
+        T_optimo = apply_transformation(T_lambda_optimo_base, apply_transformation(T_lambda,invert_transform(T_lambda_optimo_base)))
+        #linear_error = T_optimo['position'] + T_optimo_base_hand['position'] - ee_pose['position']
+        #angular_error = quat2rot(T_optimo['orientation']) @ quat2rot(T_optimo_base_hand['orientation']) @ quat2rot(T_optimo_base_hnd['orientation'])
+        T_err = apply_transformation(T_optimo, apply_transformation(T_optimo_base_hand, invert_transform(ee_pose)))
+        identity = {'position': np.zeros(3), 'orientation': np.array([0.0, 0.0, 0.0, 1.0])}
+        error_twist = compute_twist(identity, T_err)
+
+        # Update the PID controller with the error to get a twist command.
+        twist_pid = pid.update(error_twist)
+        
+        print("twist_pid = " , twist_pid)
+
+        # Publish the PID-generated twist command.
+        twist_out = TwistStamped()
+        twist_out.twist.linear.x  = twist_pid[0]
+        twist_out.twist.linear.y  = twist_pid[1]
+        twist_out.twist.linear.z  = twist_pid[2]
+        twist_out.twist.angular.x = twist_pid[3]
+        twist_out.twist.angular.y = twist_pid[4]
+        twist_out.twist.angular.z = twist_pid[5]
+        twist_publisher.publish(twist_out)
+
+        
+        force_msg = Vector3(x=0.0, y=0.0, z=0.0)
+        force_publisher.publish(force_msg)
+        
+        torque_msg = Vector3(x=0.0, y=0.0, z=0.0)
+        torque_publisher.publish(torque_msg)
+        
+        gripper_force_msg = Float64(data=0.0)
+        gripper_force_publisher.publish(gripper_force_msg)
+        
+        
+    # Combined control callback with delay on switching.
+    def control_callback():
+        nonlocal last_mode_switch_time, prev_mode
+        
+        # Get current time in seconds.
+        current_time = node.get_clock().now().nanoseconds / 1e9
+        
+        # Check if mode changed.
+        if transparency_mode != prev_mode:
+            T_optimo_base_hand['position'] = ee_pose['position']
+            last_mode_switch_time = current_time
+            prev_mode = transparency_mode
+        
+        # If within transition delay, publish zero twist.
+        if last_mode_switch_time is not None and (current_time - last_mode_switch_time < transition_delay):
+            twist_out = TwistStamped()
+            twist_out.twist.linear.x = 0.0
+            twist_out.twist.linear.y = 0.0
+            twist_out.twist.linear.z = 0.0
+            twist_out.twist.angular.x = 0.0
+            twist_out.twist.angular.y = 0.0
+            twist_out.twist.angular.z = 0.0
+            twist_publisher.publish(twist_out)
+            return
+        
+        # Otherwise, publish based on current mode.
+        if transparency_mode:
+            transparency_controller()
+        else:
+            joystick_controller()
+
+    timer = node.create_timer(0.001, control_callback)
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+

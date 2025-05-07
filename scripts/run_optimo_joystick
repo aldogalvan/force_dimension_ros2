@@ -1,0 +1,157 @@
+#!/usr/bin/python3
+
+""" A simple example that illustrates use of the Force Dimension ROS2 package.
+"""
+
+# ROS imports.
+import math
+import rclpy
+import rclpy.node
+from example_interfaces.msg import Float64
+from geometry_msgs.msg import Point, Quaternion, Vector3, TwistStamped
+from sensor_msgs.msg import JointState
+import numpy as np
+import scipy.spatial.transform as tf
+import atexit
+
+def quat2rot(q):
+    """ Convert quaternion to axis-angle representation. """
+    quat = tf.Rotation.from_quat([ q[0], q[1], q[2], q[3]])  # Convert [w, x, y, z] to [x, y, z, w]
+    angle = 2 * np.arccos(q[0])  # Extract angle
+    if angle > 1e-6:
+        axis = quat.as_rotvec() / angle  # Normalize axis
+    else:
+        axis = np.zeros(3)
+    return angle * axis
+    
+def euler_from_quaternion(x, y, z, w):
+    """
+    Converts quaternion (w in last place) to euler roll, pitch, yaw
+    quaternion = [x, y, z, w]
+    Bellow should be replaced when porting for ROS 2 Python tf_conversions is done.
+    """
+
+    sinr_cosp = 2 * (w * x + y * z)
+    cosr_cosp = 1 - 2 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2 * (w * y - z * x)
+    pitch = np.arcsin(sinp)
+
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+    return roll, pitch, yaw
+
+
+# Entry point for ROS2.
+def main():
+    """ A simple function for creating a ROS2 node that subscribes to Force 
+        Dimension position and orientation messages and applies spring-damper forces.
+    """
+    
+    # Initialize ROS.
+    rclpy.init()
+    
+    # Create a new ROS2 node.
+    node = rclpy.node.Node('optimo_node')
+    
+    # Initialize variables to hold position and orientation.
+    position = np.zeros(3)
+    velocity = np.zeros(3)
+    orientation = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion
+    angular_velocity = np.zeros(3)
+    threshold = 3e-2
+    angular_threshold = 0.1
+    linear_scale = 10.
+    angular_scale = 0.2
+    
+    
+    # Control gains
+    k_p = 150.0  # Translational stiffness
+    k_d = 5.0  # Translational damping
+    k_r = 1.0   # Rotational stiffness
+    k_w = 0.01    # Rotational damping
+    
+
+    def position_callback(msg):
+        nonlocal position
+        position = np.array([msg.x, msg.y, msg.z])
+
+    def velocity_callback(msg):
+        nonlocal velocity
+        velocity = np.array([msg.x, msg.y, msg.z])
+
+    def orientation_callback(msg):
+        nonlocal orientation
+        orientation = np.array([msg.x, msg.y, msg.z, msg.w])
+
+    def angular_velocity_callback(msg):
+        nonlocal angular_velocity
+        angular_velocity = np.array([msg.x, msg.y, msg.z])
+
+    # Subscribe to position and orientation topics.
+    node.create_subscription(Point, '/robot/feedback/position', position_callback, 10)
+    node.create_subscription(Vector3, '/robot/feedback/velocity', velocity_callback, 10)
+    node.create_subscription(Quaternion, '/robot/feedback/orientation', orientation_callback, 10)
+    node.create_subscription(Vector3, '/robot/feedback/angular_velocity', angular_velocity_callback, 10)
+
+    # Create publishers
+    force_publisher = node.create_publisher(Vector3, '/robot/command/force', 10)
+    torque_publisher = node.create_publisher(Vector3, '/robot/command/torque', 10)
+    gripper_force_publisher = node.create_publisher(Float64, '/robot/command/gripper_force', 10)
+    twist_publisher = node.create_publisher(TwistStamped,'/optimo/servo/twist_cmd',10)
+    
+
+    # joystick function to regulate to zero position and orientation
+    def joystick_controller():
+        nonlocal position, velocity, orientation, angular_velocity
+        
+        # Compute restoring force (spring-damper for translation)
+        force = -k_p * position - k_d * velocity
+
+        # Compute restoring torque (spring-damper for rotation)
+        identity_quaternion = np.array([1.0, 0.0, 0.0, 0.0])  # Target orientation
+        rotation_vector = quat2rot(orientation)  # Compute rotation error using quat2rot
+        torque = -k_r * rotation_vector - k_w * angular_velocity
+
+        # Publish force
+        force_msg = Vector3()
+        force_msg.x, force_msg.y, force_msg.z = force
+        force_publisher.publish(force_msg)
+
+        # Publish torque
+        torque_msg = Vector3()
+        torque_msg.x, torque_msg.y, torque_msg.z = torque
+        torque_publisher.publish(torque_msg)
+
+        # Publish gripper force (set to zero)
+        gripper_force_msg = Float64()
+        gripper_force_msg.data = 0.0
+        gripper_force_publisher.publish(gripper_force_msg)
+        
+        # Publish a twist velocity
+        twist_out = TwistStamped()
+        if (math.sqrt(position[0]**2 + position[1]**2 + position[2]**2) > threshold):
+            twist_out.twist.linear.x = -linear_scale*position[0]
+            twist_out.twist.linear.y = -linear_scale*position[1]
+            twist_out.twist.linear.z =  linear_scale*position[2]
+        roll, pitch, yaw = euler_from_quaternion(orientation[0], orientation[1], orientation[2], orientation[3])
+        if (abs(roll) > angular_threshold): twist_out.twist.angular.x = -angular_scale*roll
+        if (abs(pitch) > angular_threshold): twist_out.twist.angular.y = -angular_scale*pitch
+        if (abs(yaw) > angular_threshold): twist_out.twist.angular.z = angular_scale*yaw
+        twist_publisher.publish(twist_out)     	
+
+    # Create a timer to update forces
+    timer = node.create_timer(0.001, joystick_controller)
+    
+    # Spin the node.
+    rclpy.spin(node)
+    
+    # Shutdown ROS.
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+

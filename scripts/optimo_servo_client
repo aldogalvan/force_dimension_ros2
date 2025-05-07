@@ -1,0 +1,50 @@
+#!/usr/bin/python3
+
+""" A simple example that calls the optimo servo service
+"""
+
+# move_to_position/move_to_position/move_to_position_client.py
+
+import rclpy
+from rclpy.node import Node
+from optimo_msgs.srv import PosCb  # Import the service type
+
+class MoveToPositionClient(Node):
+    def __init__(self):
+        super().__init__('move_to_position_client')
+        
+        # Create a client to call the move_home_cb service
+        self.client = self.create_client(PosCb, '/optimo/optimo_effort_controller/move_home_cb')
+        
+        # Wait for the service to be available
+        while not self.client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Service not available, waiting again...')
+        
+        self.get_logger().info('Service available, calling service...')
+        
+        # Create a request with the custom position
+        request = PosCb.Request()
+        request.pos = [0, 3.3, 0, -2.35, 0, -1.13, 0]  # Define the custom position
+        
+        # Call the service asynchronously and handle the result
+        future = self.client.call_async(request)
+        future.add_done_callback(self.service_callback)
+    
+    def service_callback(self, future):
+        try:
+            # If the service was successful
+            response = future.result()
+            self.get_logger().info('Successfully moved to the requested position.')
+        except Exception as e:
+            # If there was an error in the service call
+            self.get_logger().error(f'Service call failed: {e}')
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = MoveToPositionClient()
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
