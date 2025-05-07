@@ -96,8 +96,11 @@ namespace force_dimension {
     // Publishes robot velocity messages.
     void PublishVelocity(void);
     
-    // Publishes robot angular velocity velocity messages.
+    // Publishes robot angular velocity messages.
     void PublishAngularVelocity(void);
+
+    // Publishes robot gripper velocity messages.
+    void PublishGripperVelocity(void);
     
     //// Publishes robot force messages.
     //void PublishForce(void);
@@ -151,6 +154,7 @@ namespace force_dimension {
     rclcpp::Publisher<GripperAngleMessage>::SharedPtr gripper_angle_publisher_;
     rclcpp::Publisher<VelocityMessage>::SharedPtr velocity_publisher_;
     rclcpp::Publisher<AngularVelocityMessage>::SharedPtr angular_velocity_publisher_;
+    rclcpp::Publisher<GripperVelocityMessage>::SharedPtr gripper_velocity_publisher_;
     //rclcpp::Publisher<ForceMessage>::SharedPtr force_publisher_;
     rclcpp::Subscription<ForceMessage>::SharedPtr force_subscription_;
     rclcpp::Subscription<TorqueMessage>::SharedPtr torque_subscription_;

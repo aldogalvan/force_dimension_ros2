@@ -41,10 +41,11 @@ void force_dimension::Node::PublishState() {
   PublishPosition();
   PublishOrientation();
   PublishButton();
-  PublishGripperGap();
+  //PublishGripperGap();
   PublishGripperAngle();
   PublishVelocity();
   PublishAngularVelocity();
+  PublishGripperVelocity();
   //publish_velocity();
   //publish_force();
   //publish_button();
@@ -291,6 +292,34 @@ void force_dimension::Node::PublishAngularVelocity() {
   // Publish.
   if(IsPublishableSample("angular_velocity")) angular_velocity_publisher_->publish(message);
 }
+
+/** Publish the position of the robotic end-effector.
+ *  
+ */
+void force_dimension::Node::PublishGripperVelocity() {
+  
+  // Read the gripper angle.
+  double gvel = -1;
+  bool has_gripper = hardware_disabled_ ? false : dhdHasGripper(device_id_);
+  int result = has_gripper ? dhdGetGripperAngularVelocityRad(&gvel, device_id_) : 0;
+  if(result != 0)  {
+      std::string message = "Failed to read gripper angle: ";
+      message += hardware_disabled_ ? "unknown error" : dhdErrorGetLastStr();
+      Log(message);
+      on_error();
+  }
+  
+  // Prepare a gripper angle message.
+  // ROS2 messages have "no constructor with positional arguments for the 
+  // members".
+  auto message = GripperVelocityMessage();
+  message.data = gvel;
+  
+  // Publish.
+  if(IsPublishableSample("gripper_velocity"))
+    gripper_velocity_publisher_->publish(message);
+}
+
 
 
 

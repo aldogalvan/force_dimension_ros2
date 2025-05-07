@@ -13,7 +13,17 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(example_interfaces REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 
+
+# *****************************************************************************
+# Add the custom messages
+# *****************************************************************************
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/EEWithGripper.msg"
+  DEPENDENCIES geometry_msgs
+)
 
 # *****************************************************************************
 # Find the Force Dimension SDK dependency.
@@ -77,16 +87,14 @@ find_package(rclpy REQUIRED)
 # *****************************************************************************
 # Install the Python package.
 # *****************************************************************************
-ament_python_install_package(${PROJECT_NAME})
+#ament_python_install_package(${PROJECT_NAME})
 
 # *****************************************************************************
 # Install the Python scripts.
 # *****************************************************************************
-install(PROGRAMS scripts/moveit_publisher DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS scripts/run_example DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS scripts/run_optimo DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS scripts/lambda_joystick DESTINATION lib/${PROJECT_NAME})
-
+install(PROGRAMS scripts/dvrk_controller DESTINATION lib/${PROJECT_NAME})
 
 # *****************************************************************************
 # Testing.

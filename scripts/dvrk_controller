@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+
+from std_msgs.msg import Bool, Float32
+from geometry_msgs.msg import Point, Quaternion, Vector3, Twist
+from force_dimension.msg import EEWithGripper
+from scipy.spatial.transform import Rotation as R
+import numpy as np
+from pynput import keyboard as pynput_keyboard
+
+# Reference‐frame rotation from λ to dVRK
+R_ab = R.from_matrix([[0, -1, 0],
+                      [1,  0, 0],
+                      [0,  0, 1]])
+t_ab = np.zeros(3)
+# Inverse
+R_ba = R_ab.inv()
+t_ba = -t_ab
+
+
+class DVRKControllerNode(Node):
+    def __init__(self,
+                 enable_torque_feedback: bool = False,
+                 enable_gripper_feedback: bool = False):
+        super().__init__('dvrk_controller_node')
+
+        self.enable_torque_feedback  = enable_torque_feedback
+        self.enable_gripper_feedback = enable_gripper_feedback
+
+        # ---- state storage ----
+        self.r1_pos      = np.zeros(3)
+        self.r1_ori      = [1.0, 0.0, 0.0, 0.0]
+        self.r1_grip     = 0.0
+        self.r1_lin_vel  = np.zeros(3)
+        self.r1_ang_vel  = np.zeros(3)
+        self.r1_grip_vel = 0.0
+
+        self.r2_pos      = np.zeros(3)
+        self.r2_ori      = [1.0, 0.0, 0.0, 0.0]
+        self.r2_grip     = 0.0
+        self.r2_lin_vel  = np.zeros(3)
+        self.r2_ang_vel  = np.zeros(3)
+        self.r2_grip_vel = 0.0
+
+        # ---- clutch logic ----
+        self._clutch_enabled = False
+        self._clutch_prev    = False
+
+        self._r1_freeze_pos  = np.zeros(3)
+        self._r1_freeze_ori  = [1.0, 0.0, 0.0, 0.0]
+        self._r1_freeze_grip = 0.0
+        self._r2_freeze_pos  = np.zeros(3)
+        self._r2_freeze_ori  = [1.0, 0.0, 0.0, 0.0]
+        self._r2_freeze_grip = 0.0
+
+        self._r1_offset_pos  = np.zeros(3)
+        self._r1_offset_ori  = R.from_quat([0, 0, 0, 1])
+        self._r1_offset_grip = 0.0
+        self._r2_offset_pos  = np.zeros(3)
+        self._r2_offset_ori  = R.from_quat([0, 0, 0, 1])
+        self._r2_offset_grip = 0.0
+
+        # ---- subscribers ----
+        self.create_subscription(Point,      '/robot1/feedback/position',           self._r1_pos_cb,   10)
+        self.create_subscription(Quaternion, '/robot1/feedback/orientation',        self._r1_ori_cb,   10)
+        self.create_subscription(Float32,    '/robot1/feedback/gripper_state',      self._r1_grip_cb,  10)
+        self.create_subscription(Vector3,    '/robot1/feedback/velocity',           self._r1_vel_cb,   10)
+        self.create_subscription(Vector3,    '/robot1/feedback/angular_velocity',   self._r1_avel_cb,  10)
+        self.create_subscription(Float32,    '/robot1/feedback/gripper_velocity',   self._r1_gvel_cb,  10)
+
+        self.create_subscription(Point,      '/robot2/feedback/position',           self._r2_pos_cb,   10)
+        self.create_subscription(Quaternion, '/robot2/feedback/orientation',        self._r2_ori_cb,   10)
+        self.create_subscription(Float32,    '/robot2/feedback/gripper_state',      self._r2_grip_cb,  10)
+        self.create_subscription(Vector3,    '/robot2/feedback/velocity',           self._r2_vel_cb,   10)
+        self.create_subscription(Vector3,    '/robot2/feedback/angular_velocity',   self._r2_avel_cb,  10)
+        self.create_subscription(Float32,    '/robot2/feedback/gripper_velocity',   self._r2_gvel_cb,  10)
+
+        # ---- haptics publishers ----
+        self._r1_force_pub  = self.create_publisher(Vector3, '/robot1/command/force',         10)
+        self._r1_torque_pub = self.create_publisher(Vector3, '/robot1/command/torque',        10)
+        self._r1_grip_pub   = self.create_publisher(Float32, '/robot1/command/gripper_force', 10)
+
+        self._r2_force_pub  = self.create_publisher(Vector3, '/robot2/command/force',         10)
+        self._r2_torque_pub = self.create_publisher(Vector3, '/robot2/command/torque',        10)
+        self._r2_grip_pub   = self.create_publisher(Float32, '/robot2/command/gripper_force', 10)
+
+        # ---- teleop publishers & feedback subs ----
+        self._psm1_pub       = self.create_publisher(EEWithGripper, '/psm1/command/ee_with_gripper', 10)
+        self._psm2_pub       = self.create_publisher(EEWithGripper, '/psm2/command/ee_with_gripper', 10)
+        self._ecm_pub        = self.create_publisher(Twist,          '/ecm/command/ee_twist',          10)
+        self._ecm_clutch_pub = self.create_publisher(Bool,           '/ecm/command/clutch',            10)
+
+        self.create_subscription(EEWithGripper, '/psm1/feedback/ee_with_gripper', self._psm1_ee_cb, 10)
+        self.create_subscription(EEWithGripper, '/psm2/feedback/ee_with_gripper', self._psm2_ee_cb, 10)
+
+        # ---- timers ----
+        self.create_timer(0.005, self._dvrk_controller)
+        self.create_timer(0.001, self._haptic_controller)
+
+        # ---- keyboard listener ----
+        self._setup_keyboard_listener()
+
+    # subscriber callbacks
+    def _r1_pos_cb(self, msg):   self.r1_pos      = np.array([msg.x, msg.y, msg.z])
+    def _r1_ori_cb(self, msg):   self.r1_ori      = [msg.w, msg.x, msg.y, msg.z]
+    def _r1_grip_cb(self, msg):  self.r1_grip     = msg.data
+    def _r1_vel_cb(self, msg):   self.r1_lin_vel  = np.array([msg.x, msg.y, msg.z])
+    def _r1_avel_cb(self, msg):  self.r1_ang_vel  = np.array([msg.x, msg.y, msg.z])
+    def _r1_gvel_cb(self, msg):  self.r1_grip_vel = msg.data
+
+    def _r2_pos_cb(self, msg):   self.r2_pos      = np.array([msg.x, msg.y, msg.z])
+    def _r2_ori_cb(self, msg):   self.r2_ori      = [msg.w, msg.x, msg.y, msg.z]
+    def _r2_grip_cb(self, msg):  self.r2_grip     = msg.data
+    def _r2_vel_cb(self, msg):   self.r2_lin_vel  = np.array([msg.x, msg.y, msg.z])
+    def _r2_avel_cb(self, msg):  self.r2_ang_vel  = np.array([msg.x, msg.y, msg.z])
+    def _r2_gvel_cb(self, msg):  self.r2_grip_vel = msg.data
+
+    def _psm1_ee_cb(self, msg):  self.psm1_ee_with_gripper = msg
+    def _psm2_ee_cb(self, msg):  self.psm2_ee_with_gripper = msg
+
+    # keyboard listener
+    def _setup_keyboard_listener(self):
+        def _set_clutch(en):
+            if en != self._clutch_enabled:
+                self._clutch_enabled = en
+                self.get_logger().info(f"Clutch {'ENGAGED' if en else 'RELEASED'}")
+
+        def on_press(key):
+            try:
+                if key.char == 'b':
+                    _set_clutch(True)
+            except: pass
+
+        def on_release(key):
+            try:
+                if key.char == 'b':
+                    _set_clutch(False)
+            except: pass
+
+        l = pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
+        l.daemon = True
+        l.start()
+
+
+    # teleoperation controller with clutch offset logic
+    def _dvrk_controller(self):
+        # detect clutch edges
+        if   self._clutch_enabled and not self._clutch_prev:
+            # pressed → record freeze state
+            self._r1_freeze_pos  = self.r1_pos.copy()
+            self._r1_freeze_ori  = list(self.r1_ori)
+            self._r1_freeze_grip = self.r1_grip
+            self._r2_freeze_pos  = self.r2_pos.copy()
+            self._r2_freeze_ori  = list(self.r2_ori)
+            self._r2_freeze_grip = self.r2_grip
+
+        elif not self._clutch_enabled and self._clutch_prev:
+            # released → compute offsets
+            self._r1_offset_pos  = self._r1_freeze_pos - self.r1_pos
+            qf1 = R.from_quat([*self._r1_freeze_ori[1:], self._r1_freeze_ori[0]])
+            qr1 = R.from_quat([*self.r1_ori[1:], self.r1_ori[0]])
+            self._r1_offset_ori = qf1 * qr1.inv()
+            self._r1_offset_grip = self._r1_freeze_grip - self.r1_grip
+
+            self._r2_offset_pos  = self._r2_freeze_pos - self.r2_pos
+            qf2 = R.from_quat([*self._r2_freeze_ori[1:], self._r2_freeze_ori[0]])
+            qr2 = R.from_quat([*self.r2_ori[1:], self.r2_ori[0]])
+            self._r2_offset_ori = qf2 * qr2.inv()
+            self._r2_offset_grip = self._r2_freeze_grip - self.r2_grip
+
+        self._clutch_prev = self._clutch_enabled
+
+        # publish commands for psm1 & psm2
+        for idx in (1, 2):
+            if idx == 1:
+                freeze_p, freeze_o, freeze_g = self._r1_freeze_pos, self._r1_freeze_ori, self._r1_freeze_grip
+                raw_p, raw_o, raw_g      = self.r1_pos,          self.r1_ori,          self.r1_grip
+                off_p, off_o, off_g      = self._r1_offset_pos,  self._r1_offset_ori,  self._r1_offset_grip
+                pub = self._psm1_pub
+            else:
+                freeze_p, freeze_o, freeze_g = self._r2_freeze_pos, self._r2_freeze_ori, self._r2_freeze_grip
+                raw_p, raw_o, raw_g      = self.r2_pos,          self.r2_ori,          self.r2_grip
+                off_p, off_o, off_g      = self._r2_offset_pos,  self._r2_offset_ori,  self._r2_offset_grip
+                pub = self._psm2_pub
+
+            if self._clutch_enabled:
+                cmd_p, cmd_o, cmd_g = freeze_p, freeze_o, freeze_g
+            else:
+                cmd_p = raw_p + off_p
+                qcmd = (off_o * R.from_quat([*raw_o[1:], raw_o[0]])).as_quat()
+                cmd_o = [qcmd[3], qcmd[0], qcmd[1], qcmd[2]]
+                cmd_g = raw_g + off_g
+
+            ee = EEWithGripper()
+            # Apply transforms before publishing
+            cmd_p = R_ab.apply(cmd_p)
+            cmd_o = (R_ab*R.from_quat(cmd_o, scalar_first=True)).as_quat(scalar_first=True)
+            ee.pose.position.x, ee.pose.position.y, ee.pose.position.z = cmd_p
+            ee.pose.orientation.w, ee.pose.orientation.x, ee.pose.orientation.y, ee.pose.orientation.z = cmd_o
+            ee.gripper_state = Float32(data=float(cmd_g))
+            pub.publish(ee)
+
+        # echo ECM twist and clutch state
+        self._ecm_pub.publish(Twist())
+        self._ecm_clutch_pub.publish(Bool(data=self._clutch_enabled))
+
+    # ------------------------------------------------------------------
+    # HAPTIC CONTROLLER — uses subscribed velocities (1 kHz)
+    # ------------------------------------------------------------------
+    def _haptic_controller(self):
+        """
+        Virtual‑coupling law:
+
+            F_t   =  k_l (p_cmd – p_raw)  –  b_l · v_raw
+            τ_t   =  k_r (R_cmd ▷ R_raw)  –  b_r · ω_raw
+            F_g   =  k_g (g_cmd – g_raw)  –  b_g · ġ_raw
+
+        with raw linear (v_raw), angular (ω_raw) and gripper (ġ_raw)
+        velocities taken **directly from the robot feedback topics**.
+
+        All quantities with the subscript “_t” are expressed in the tele‑op
+        frame (λ).  The resulting wrench is transformed back to the device
+        frame before publishing.
+        """
+        # ------------------------------------------------------------------
+        # 1) Clutch pressed  →  zero feedback
+        # ------------------------------------------------------------------
+        if self._clutch_enabled:
+            zero_vec = Vector3(x=0.0, y=0.0, z=0.0)
+            zero_f32 = Float32(data=0.0)
+
+            self._r1_force_pub.publish(zero_vec)
+            self._r2_force_pub.publish(zero_vec)
+
+            if self.enable_torque_feedback:
+                self._r1_torque_pub.publish(zero_vec)
+                self._r2_torque_pub.publish(zero_vec)
+
+            if self.enable_gripper_feedback:
+                self._r1_grip_pub.publish(zero_f32)
+                self._r2_grip_pub.publish(zero_f32)
+            return
+
+        # ------------------------------------------------------------------
+        # 2) Need PSM command feedback before we can couple
+        # ------------------------------------------------------------------
+        if not hasattr(self, 'psm1_ee_with_gripper') or \
+           not hasattr(self, 'psm2_ee_with_gripper'):
+            return
+
+        # gains
+        k_l, b_l = 100.0,  5.0     # translation  (N / m, N·s / m)
+        k_r, b_r =  10.0,  1.0     # rotation     (N m / rad, N m·s / rad)
+        k_g, b_g =  10.0,  1.0     # gripper      (N / rad, N·s / rad)
+
+        # ------------------------------------------------------------------
+        # 3) Per‑device coupling
+        # ------------------------------------------------------------------
+        for i in (1, 2):
+
+            if i == 1:
+                off_p  = self._r1_offset_pos
+            else:
+                off_p  = self._r2_offset_pos
+
+            # ---- current (raw) state from manipulator ----
+            p_raw      = getattr(self, f'r{i}_pos')
+            q_raw_wxyz = getattr(self, f'r{i}_ori')          # [w,x,y,z]
+            g_raw      = getattr(self, f'r{i}_grip')
+
+            v_raw      = getattr(self, f'r{i}_lin_vel')      # m/s  (device frame)
+            w_raw      = getattr(self, f'r{i}_ang_vel')      # rad/s
+            gdot_raw   = getattr(self, f'r{i}_grip_vel')     # rad/s
+
+            # ---- commanded tele‑op pose ----
+            ee_msg     = getattr(self, f'psm{i}_ee_with_gripper')
+            p_cmd_t    = np.array([ee_msg.pose.position.x,
+                                   ee_msg.pose.position.y,
+                                   ee_msg.pose.position.z]) 
+            q_cmd_t    = R.from_quat([ee_msg.pose.orientation.x,
+                                      ee_msg.pose.orientation.y,
+                                      ee_msg.pose.orientation.z,
+                                      ee_msg.pose.orientation.w])
+            g_cmd      = float(ee_msg.gripper_state.data)
+
+            # ---- transform raw pose & velocity into tele‑op frame ----
+            p_raw_t    = R_ab.apply(p_raw + off_p) + t_ab
+            v_raw_t    = R_ab.apply(v_raw)
+            w_raw_t    = R_ab.apply(w_raw)
+
+            R_raw_d    = R.from_quat([q_raw_wxyz[1], q_raw_wxyz[2],
+                                      q_raw_wxyz[3], q_raw_wxyz[0]])
+            R_raw_t    = R_ab * R_raw_d
+
+            # ---- virtual‑coupling forces/torques ----
+            F_t   = k_l * (p_cmd_t - p_raw_t)  -  b_l * v_raw_t
+
+            rot_err_vec = (q_cmd_t * R_raw_t.inv()).as_rotvec()
+            τ_t   = k_r * rot_err_vec          -  b_r * w_raw_t
+
+            F_g   = k_g * (g_cmd - g_raw)      -  b_g * gdot_raw
+
+            # ---- map wrench back to device frame ----
+            F_dev   = R_ba.apply(F_t)
+            τ_dev   = R_ba.apply(τ_t)
+
+            # ---- publish on appropriate topics ----
+            if i == 1:
+                self._r1_force_pub.publish(Vector3(x=float(F_dev[0]),
+                                                   y=float(F_dev[1]),
+                                                   z=float(F_dev[2])))
+                if self.enable_torque_feedback:
+                    self._r1_torque_pub.publish(Vector3(x=float(τ_dev[0]),
+                                                        y=float(τ_dev[1]),
+                                                        z=float(τ_dev[2])))
+                if self.enable_gripper_feedback:
+                    self._r1_grip_pub.publish(Float32(data=float(F_g)))
+            else:
+                self._r2_force_pub.publish(Vector3(x=float(F_dev[0]),
+                                                   y=float(F_dev[1]),
+                                                   z=float(F_dev[2])))
+                if self.enable_torque_feedback:
+                    self._r2_torque_pub.publish(Vector3(x=float(τ_dev[0]),
+                                                        y=float(τ_dev[1]),
+                                                        z=float(τ_dev[2])))
+                if self.enable_gripper_feedback:
+                    self._r2_grip_pub.publish(Float32(data=float(F_g)))
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DVRKControllerNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

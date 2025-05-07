@@ -73,8 +73,8 @@ void Node::on_configure(void) {
   button_publisher_ = create_publisher<ButtonMessage>(topic, qos);
   
   // Create the gripper gap state publisher.
-  topic = GRIPPER_GAP_FEEDBACK_TOPIC;
-  gripper_gap_publisher_ = create_publisher<GripperGapMessage>(topic, qos);
+  // topic = GRIPPER_GAP_FEEDBACK_TOPIC;
+  // gripper_gap_publisher_ = create_publisher<GripperGapMessage>(topic, qos);
   
   // Create the gripper angle state publisher.
   topic = GRIPPER_ANGLE_FEEDBACK_TOPIC;
@@ -87,6 +87,10 @@ void Node::on_configure(void) {
     // Create the velocity state publisher.
   topic = ANGULAR_VELOCITY_FEEDBACK_TOPIC;
   angular_velocity_publisher_ = create_publisher<AngularVelocityMessage>(topic, qos);
+
+  // Create the gripper gap state publisher.
+  topic = GRIPPER_VELOCITY_FEEDBACK_TOPIC;
+  gripper_velocity_publisher_ = create_publisher<GripperVelocityMessage>(topic, qos);
   
   //// Create the force state publisher.
   //topic = FORCE_FEEDBACK_TOPIC;
@@ -101,7 +105,7 @@ void Node::on_configure(void) {
   declare_parameter<int>("feedback_sample_decimation.velocity", 50);
   declare_parameter<int>("feedback_sample_decimation.angular_velocity", 50);
   declare_parameter<int>("feedback_sample_decimation.button", 50);
-  declare_parameter<int>("feedback_sample_decimation.gripper_gap", 50);
+  declare_parameter<int>("feedback_sample_decimation.gripper_velocity", 50);
   declare_parameter<int>("feedback_sample_decimation.gripper_angle", 50);
   declare_parameter<float>("effector_mass_kg", 0.190000);
   declare_parameter<bool>("gravity_compensation", true);
@@ -220,7 +224,7 @@ void Node::on_activate(void) {
   // Enable gravity compensation.
   // Defaults to the ROS parameter value.
   //set_gravity_compensation();
-  
+  // Enable the force
   dhdEnableForce(1);
   
   // Add a set parameters callback.

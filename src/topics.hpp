@@ -85,6 +85,11 @@ namespace force_dimension {
    */
   const char GRIPPER_ANGLE_FEEDBACK_TOPIC[] = "feedback/gripper_angle";
 
+    /** Topic for gripper velocity feedback.
+   *  
+   */
+  const char GRIPPER_VELOCITY_FEEDBACK_TOPIC[] = "feedback/gripper_velocity";
+
 } // namespace force_dimension
 
 
